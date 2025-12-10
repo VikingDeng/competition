@@ -10,11 +10,11 @@ Qwen/Qwen1.5-MoE-A2.7B-Chat
 
 在无精度误差的情况下提速这两个模型的prefill，decode和显存峰值
 
-![img](https://kxqaj5kr937.feishu.cn/space/api/box/stream/download/asynccode/?code=NWIwMTIzNjY4NDhkMTI4ZmYxNTFmMWNhOWIyNWRlYzZfeldtbk84b3lhUWVNYjJCZlRtT05TZ0JubU1hMzB0S3RfVG9rZW46WU10NmJsWXFab01CaER4NFlHT2NZRzJHbjJuXzE3NjQ3NTAyNDg6MTc2NDc1Mzg0OF9WNA)
+![img](./assets/score计算.png)
 
 ## 最终成绩
 
-![img](https://kxqaj5kr937.feishu.cn/space/api/box/stream/download/asynccode/?code=Zjk2MzEzNmNhYWUxODQ5NzI1NTNhODRmMjhmMDljMGZfeWNuZ0tzT3JBcHBlY0Z1ZnFJWHRNczRGWnd1UWFOaGdfVG9rZW46QVRXVWJGeUpGb2k5R094WmxuVGM5TUdEbmxmXzE3NjQ3NTAyNDg6MTc2NDc1Mzg0OF9WNA)
+![img](./assets/最终成绩.png)
 
 # 比赛复盘
 
@@ -32,7 +32,7 @@ Qwen/Qwen1.5-MoE-A2.7B-Chat
   - 通过简单网络来测试，flash-attention对于长序列确而有提速效果，但是在中短序列不明显，有时候还会因为未知波动效果不如baseline
   - 官方接口 `mindspore.ops.flash_attention_score`会带来一定的精度误差，具体而言qwen的prompt2会mismatch
 - 算子融合
-  - F.rms_norm 不仅没加速还带来了精度误差(应该是qwen的prompt1会mismatch)，遂直接放弃
+  - F.rms_norm 不仅没加速还带来了精度误差(应该是qwen的prompt1会mismatch)，遂直接放弃；对于review中提到的融合算子精度对齐没有缺陷，我猜测可能是进入F.rms_norm前所必须做的精度转化操作导致的，虽然我当时尝试了float32也还是有mismatch
   - 但是我没太理解会议里面讲的要比较下放损耗和融合算子加速效果，我个人仍然觉得这应该要work，但是却没有
 - Graph&Pynative mode - kernal/图复用
   - 一开始打算用分桶填充策略，设置 `seq_len = [1,2,4,8,..,128]`的桶来多次调用模型生成来生成这些尺寸的图，为输入的prompt寻找恰好不小于他的桶进行padding触发图复用，但是毫无效果，于是开始探索图复用的条件，网上有说法是需要 `@mindspore.jit`即时编译/`Graph mode`静态图模式才能生成可以复用的图，于是进入下一步测试
@@ -41,7 +41,7 @@ Qwen/Qwen1.5-MoE-A2.7B-Chat
   - static-cache ：没做成功，因为需要把动态cache 换成 static cache，bug较多，时间上不允许，而且直播的时候说提升不大。
 - Profiler
   - 这是一个很好的工具(疑似)，但是直到最后都不知道如何使用,一方面是断点设置和信息收集的问题，但这个问题不大
-  - ![img](https://kxqaj5kr937.feishu.cn/space/api/box/stream/download/asynccode/?code=ODNmOTFhMDg2NjZjYmJmODgwMjBlNzVjYTE1MWFiMzRfTTh1S1pnUVZXbWdPRGU0MGhSREh5TU05ZkRaNEJCMGZfVG9rZW46VmFIRWJnMDlob1FUV294YktYZGNTNklqbnlmXzE3NjQ3NTAyNDg6MTc2NDc1Mzg0OF9WNA)
+  - ![img](./assets/mindstudio.png)
   - 最重要的是这个页面我只看到NPU的free/compute比值很大，除此之外不知道如何分析来调优了,要是能看**别人实际调优一遍肯定会好很多，求教程！！**
 - MOE分析
   - 通过模型原来的代码，在self.mlp = ... 这一行，我发现了有一个if控制流，走moe/mlp,尝试使用走mlp之后，prefill/decode耗时降低了**20倍**，这时候我才意识到，原来前面有的没的都是**次要矛盾**，只要把**moe这个模块的代码**优化好了，就已经胜利了
@@ -186,14 +186,17 @@ Qwen/Qwen1.5-MoE-A2.7B-Chat
   -  在预热的时候，记录下所有被激活过的专家的ID，缓存那些在预热中被激活过的active_ids的权重（ops.stack）。
   -  如果缓存已经建立，并且当前需要的专家 eid 就在缓存里，它会直接从连续的 cache_gate_w 张量中索引权重。
 
+
+
 ## 收益点
 
-| DeepseekMoe + Qwen moe都进行MoE模块前向优化，decode直接遍历激活专家 | 总分的具体收益估计是从100->120                               |
-| ------------------------------------------------------------ | ------------------------------------------------------------ |
-| 在DeepseekAttention和QwenAttention的forward函数里有用apply_rotary_pos_emb函数，而对于该函数里用了rotate_half函数。对于rotate_half函数，可以使用 ops.split 代替 x[..., : x.shape[-1] // 2] 和 x[..., x.shape[-1] // 2 :]。 | 显存峰值100优化后100prefill133.4445 132.4821decode427.7311 437.5848总分220.919 223.3556 |
-| **moe_prefill_fast** 通过将权重堆叠、对输入 tokens 重新排序，将原本多个小的、串行的专家计算，转换为了几个大的、连续的计算块，并使用一个高效的 scatter_add 操作完成结果聚合，从而大幅提升了性能。**moe_decode_fast** 将多个小规模的、串行的专家计算，巧妙地转换成了一次大规模的、并行的批量矩阵乘法（bmm）操作，彻底消除了 Python 循环，因此速度更快。但是有mismatch，所以根据LongPrompt来做dispatch | 显存峰值100优化后98.4848prefill132.4821 163.8114decode437.5848 454.7424总分223.3556 239.0129 |
-| **init_active_expert_cache**和**warmup_moe_model_deep**：在预热的时候，记录下所有被激活过的专家的ID，缓存那些在预热中被激活过的active_ids的权重（ops.stack）。如果缓存已经建立，并且当前需要的专家 eid 就在缓存里，它会直接从连续的 cache_gate_w 张量中索引权重。 | 显存峰值98.4848优化后98.4848prefill163.8114 198.4985decode454.7424 493.2538总分239.0129 263.4124 |
-| 通过 **Pad -> BMM -> Gather** 的流程，将所有专家的计算合并为单个、大规模的并行操作Pad : 将分配给不同专家的、数量不等的“锯齿状”token数据，通过 tensor_scatter_update 填充成一个规整的、[专家数, 最大Token数, 隐藏层大小] 的“矩形”张量。BMM: 利用这个规整的张量，调用一次 ops.bmm 即可同时计算所有专家的输出，将硬件并行度拉满。Gather : 计算完成后，用 gather_nd 从填充后的结果中高效地提取出有效的输出数据。+但是有mismatch，解决思路是：在核心计算中使用 float32 保证数值精度，从根本上解决 mismatch 问题+根据LongPrompt来做dispatch | 显存峰值98.4848优化后83.3333prefill198.4985 487.1616decode493.2538 490.5996总分263.4124 353.6982 |
+|                     策略名称                     | 说明                                                         |    显存峰值     |      Prefill      |      Decode       |       总分        |
+| :----------------------------------------------: | :----------------------------------------------------------- | :-------------: | :---------------: | :---------------: | :---------------: |
+|          DeepseekMoe + Qwen MoE模块优化          | Decode直接遍历激活专家                                       |     100→100     |      100→132      |      100→400      |      100→200      |
+|                    Rotary优化                    | 用`ops.split`替代`rotate_half`切片方式                       |     100→100     | 133.4445→132.4821 | 427.7311→437.5848 | 220.919→223.3556  |
+|        moe_prefill_fast / moe_decode_fast        | 串行专家计算改为大批量并行BMM，减少Python循环，速度更快（LongPrompt dispatch） |   100→98.4848   | 132.4821→163.8114 | 437.5848→454.7424 | 223.3556→239.0129 |
+| init_active_expert_cache / warmup_moe_model_deep | 缓存预热期间激活专家权重，直接索引cache提升性能              | 98.4848→98.4848 | 163.8114→198.4985 | 454.7424→493.2538 | 239.0129→263.4124 |
+|                Pad→BMM→Gather流程                | 将专家计算合并为一次BMM，保证精度float32并按LongPrompt dispatch | 98.4848→83.3333 | 198.4985→487.1616 | 493.2538→490.5996 | 263.4124→353.6982 |
 
 ## 总结
 
